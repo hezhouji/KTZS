@@ -4,128 +4,127 @@ import pandas as pd
 import numpy as np
 from scipy import stats
 import requests
-import json
 import os
 from datetime import datetime, timedelta
 
 FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK")
 
-def calculate_percentile_score(current_value, history_series, reverse=False):
-    history_series = history_series.dropna()
-    if history_series.empty: return 50
-    percentile = stats.percentileofscore(history_series, current_value)
-    return 100 - percentile if reverse else percentile
-
-def get_label(score):
-    if score <= 20: return "🥶 极度恐惧 (建议贪婪)"
-    elif score <= 40: return "😨 恐惧 (分批买入)"
+def get_fear_greed_label(score):
+    if score <= 20: return "😱 极度恐惧 (韭圈儿：极低估)"
+    elif score <= 40: return "😨 恐惧 (建议定投)"
     elif score <= 60: return "😐 中立"
-    elif score <= 80: return "🤩 贪婪 (谨慎追高)"
-    else: return "🔥 极度贪婪 (建议恐惧)"
+    elif score <= 80: return "🤩 贪婪 (分批止盈)"
+    else: return "🔥 极度贪婪 (韭圈儿：风险区)"
 
-def analyze_ashare():
-    print(">>> 正在计算 A股 (沪深300) 股债利差模型...")
+def analyze_ashare_jiuquan():
+    """
+    仿韭圈儿：基于沪深300长期股债利差百分位
+    """
+    print(">>> 正在复刻韭圈儿算法：计算A股性价比...")
     try:
-        # 获取估值数据
+        # 1. 获取近10年沪深300估值 (为了得到准确的分位数，必须有足够长的历史)
         df_val = ak.stock_zh_index_value_csindex(symbol="000300")
         
-        # 精准匹配：根据日志，接口返回的是 '市盈率1' (滚动PE)
-        # 我们优先使用 '市盈率1'，如果不存在则找包含 '市盈率' 的列
-        pe_cols = [c for c in ['市盈率1', '市盈率2'] if c in df_val.columns]
-        if not pe_cols:
-            pe_cols = [c for c in df_val.columns if '市盈率' in c]
-            
-        if not pe_cols:
-            print(f"未能识别PE列。当前列名: {df_val.columns.tolist()}")
-            return None
-            
+        # 匹配列名
+        pe_col = '市盈率1' if '市盈率1' in df_val.columns else '市盈率TTM'
         df_val['日期'] = pd.to_datetime(df_val['日期'])
-        df_val.set_index('日期', inplace=True)
+        df_val = df_val.sort_values('日期')
         
-        # 获取10年期国债收益率
+        # 2. 获取10年期国债收益率
         df_bond = ak.bond_zh_us_rate()
         df_bond['日期'] = pd.to_datetime(df_bond['日期'])
         df_bond.set_index('日期', inplace=True)
         
-        merged = pd.DataFrame()
-        merged['pe'] = df_val[pe_cols[0]]
-        merged = merged.join(df_bond['中国国债收益率10年'], how='inner')
+        # 3. 合并数据并填充空值 (防止因为节假日错开导致 join 失败)
+        df_val.set_index('日期', inplace=True)
+        merged = df_val[[pe_col]].join(df_bond['中国国债收益率10年'], how='left')
+        merged = merged.ffill() # 重点：向前填充，解决数据频率不一致导致的0值问题
         
-        # 计算股债利差 (ERP)
-        merged['spread'] = (1 / merged['pe']) - (merged['中国国债收益率10年'] / 100)
+        # 4. 计算 ERP (股权风险溢价)
+        # 韭圈儿逻辑：1/PE (盈利收益率) - 国债收益率
+        merged['erp'] = (1 / merged[pe_col]) - (merged['中国国债收益率10年'] / 100)
         
-        current_spread = merged['spread'].iloc[-1]
-        score = calculate_percentile_score(current_spread, merged['spread'], reverse=True)
+        # 5. 计算当前 ERP 在过去 10 年的位置 (百分位)
+        current_erp = merged['erp'].iloc[-1]
+        history_erp = merged['erp'].dropna()
+        
+        # 韭圈儿恐贪指数通常 0 是极度恐惧，100 是极度贪婪
+        # ERP 越大越值得买（恐惧），所以 ERP 越高，分数应该越低
+        percentile = stats.percentileofscore(history_erp, current_erp)
+        final_score = 100 - percentile # 转化：高分=贪婪，低分=恐惧
         
         return {
-            "market": "A股 (沪深 300)",
-            "score": int(score),
-            "label": get_label(score),
-            "detail": f"PE: {merged['pe'].iloc[-1]:.2f} | 利差: {current_spread*100:.2f}%"
+            "market": "A股 (沪深300)",
+            "score": int(final_score),
+            "label": get_fear_greed_label(final_score),
+            "detail": f"PE: {merged[pe_col].iloc[-1]:.2f} | 利差: {current_erp*100:.2f}%"
         }
     except Exception as e:
-        print(f"A股计算失败: {str(e)}")
+        print(f"A股韭圈儿算法运行失败: {e}")
         return None
 
-def analyze_us_share():
-    print(">>> 正在计算 美股 (标普500) 混合模型...")
+def analyze_us_fear_greed():
+    """
+    美股：采用 CNN Fear & Greed 简化版 (VIX + 动量)
+    """
     try:
-        vix = yf.Ticker("^VIX").history(period="1y")['Close']
+        vix = yf.Ticker("^VIX").history(period="2y")['Close']
         spy = yf.Ticker("^GSPC").history(period="2y")['Close']
         
-        score_vix = calculate_percentile_score(vix.iloc[-1], vix, reverse=True)
+        # VIX越高越恐惧 (分数越低)
+        vix_p = stats.percentileofscore(vix, vix.iloc[-1])
+        vix_score = 100 - vix_p
+        
+        # 偏离200日均线程度
         ma200 = spy.rolling(window=200).mean()
         bias = (spy - ma200) / ma200
-        score_bias = calculate_percentile_score(bias.iloc[-1], bias, reverse=False)
+        bias_p = stats.percentileofscore(bias.dropna(), bias.iloc[-1])
         
-        final_score = (score_vix * 0.5) + (score_bias * 0.5)
+        final_score = (vix_score * 0.6) + (bias_p * 0.4)
         
         return {
-            "market": "美股 (标普 500)",
+            "market": "美股 (S&P500)",
             "score": int(final_score),
-            "label": get_label(final_score),
-            "detail": f"VIX: {vix.iloc[-1]:.2f} | 200日乖离: {bias.iloc[-1]*100:+.2f}%"
+            "label": get_fear_greed_label(final_score),
+            "detail": f"VIX: {vix.iloc[-1]:.2f} | 200日偏离: {bias.iloc[-1]*100:+.2f}%"
         }
     except Exception as e:
-        print(f"美股计算失败: {str(e)}")
+        print(f"美股计算失败: {e}")
         return None
 
-def send_feishu(results):
-    if not FEISHU_WEBHOOK:
-        print("未检测到 Webhook")
-        return
-
+def send_to_feishu(results):
+    if not FEISHU_WEBHOOK: return
+    
+    # 构建飞书消息卡片
     elements = []
     for res in results:
-        bar_count = max(1, res['score'] // 10)
-        bar = "🔴" * bar_count + "⬜" * (10 - bar_count)
+        # 根据分值动态选色
+        color = "blue" if res['score'] < 40 else "red" if res['score'] > 60 else "grey"
+        bar = "🟦" * (res['score'] // 10) + "⬜" * (10 - res['score'] // 10)
+        
         elements.append({
             "tag": "div",
-            "text": {"tag": "lark_md", "content": f"**{res['market']}**\n指数：{res['score']} {bar}\n状态：{res['label']}\n数据：{res['detail']}"}
+            "text": {"tag": "lark_md", "content": f"**{res['market']}**\n指数: **{res['score']}** {bar}\n属性: {res['label']}\n数据说明: {res['detail']}"}
         })
         elements.append({"tag": "hr"})
 
-    # 固定包含关键词：恐贪指数
     payload = {
         "msg_type": "interactive",
         "card": {
-            "header": {"title": {"tag": "plain_text", "content": "📊 恐贪指数每日提醒"}, "template": "blue"},
+            "header": {"title": {"tag": "plain_text", "content": "📊 韭圈儿式恐贪指数提醒"}, "template": "orange"},
             "elements": elements
         }
     }
-    
     r = requests.post(FEISHU_WEBHOOK, json=payload)
-    print(f"飞书推送结果: {r.status_code}, {r.text}")
+    print(f"推送状态: {r.status_code}")
 
 if __name__ == "__main__":
-    final_results = []
-    res_cn = analyze_ashare()
-    if res_cn: final_results.append(res_cn)
+    data = []
+    cn = analyze_ashare_jiuquan()
+    if cn: data.append(cn)
     
-    res_us = analyze_us_share()
-    if res_us: final_results.append(res_us)
+    us = analyze_us_fear_greed()
+    if us: data.append(us)
     
-    if final_results:
-        send_feishu(final_results)
-    else:
-        print("计算失败，无法发送")
+    if data:
+        send_to_feishu(data)
