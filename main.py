@@ -6,80 +6,110 @@ import requests
 import os
 from datetime import datetime
 
-# 配置环境变量
+# 从 GitHub Secrets 读取环境变量
 FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK")
 
 def get_percentile(series, current_val):
+    """计算当前值在历史序列中的百分位排位 (0-100)"""
     series = series.dropna()
     if series.empty: return 50
     return stats.percentileofscore(series, current_val)
 
-def analyze_jiuquan_v3():
-    """
-    韭圈儿本土化模型：多因子情绪合成
-    """
-    print(">>> 正在模拟韭圈儿本土化算法：计算全市场情绪...")
+def analyze_jiuquan_final():
+    print(">>> 正在复刻韭圈儿 83 分逻辑模型...")
     try:
-        # 1. 股价强度/广度 (权重 30%) - 反映“龙腾股跃”的关键
-        # 使用沪深300价格偏离20日和120日线的程度
+        # --- 1. 获取基础数据：沪深300指数 ---
         df_p = ak.stock_zh_index_daily(symbol="sh000300")
         df_p['close'] = df_p['close'].astype(float)
-        bias_short = (df_p['close'] - df_p['close'].rolling(20).mean()) / df_p['close'].rolling(20).mean()
-        bias_long = (df_p['close'] - df_p['close'].rolling(120).mean()) / df_p['close'].rolling(120).mean()
-        score_momentum = (get_percentile(bias_short, bias_short.iloc[-1]) * 0.4 + 
-                          get_percentile(bias_long, bias_long.iloc[-1]) * 0.6)
+        df_p['日期'] = pd.to_datetime(df_p['date'])
+        
+        # --- 2. 动量因子 (影响分数的关键：热度) ---
+        # 计算价格偏离 120 日线的程度 (Bias)
+        ma120 = df_p['close'].rolling(window=120).mean()
+        bias = (df_p['close'] - ma120) / ma120
+        # 价格越高分越高（贪婪）
+        score_momentum = get_percentile(bias, bias.iloc[-1])
 
-        # 2. 股债比类 (权重 20%) - 宏观性价比
+        # --- 3. 股债性价比因子 (底层安全垫：估值) ---
         df_val = ak.stock_zh_index_value_csindex(symbol="000300")
         df_bond = ak.bond_zh_us_rate()
         df_bond['日期'] = pd.to_datetime(df_bond['日期'])
         df_val['日期'] = pd.to_datetime(df_val['日期'])
-        merged = pd.merge(df_val, df_bond[['日期', '中国国债收益率10年']], on='日期', how='inner')
-        erp = (1 / merged['市盈率1']) - (merged['中国国债收益率10年'] / 100)
-        # ERP越高代表越便宜(恐惧)，所以得分 = 100 - 百分位
-        score_erp = 100 - get_percentile(erp, erp.iloc[-1])
-
-        # 3. 资金流入/活跃度 (权重 25%) - 成交量放大
-        df_p['vol_ma'] = df_p['volume'].rolling(20).mean()
-        vol_ratio = df_p['volume'] / df_p['vol_ma']
-        score_vol = get_percentile(vol_ratio, vol_ratio.iloc[-1])
-
-        # 4. 期货基差/波动率模拟 (权重 25%) 
-        # 简化版：通过历史波动率的标准差分位来模拟情绪亢奋度
-        std_20 = df_p['close'].pct_change().rolling(20).std()
-        score_vix = get_percentile(std_20, std_20.iloc[-1])
-
-        # --- 最终加权合成 ---
-        # 逻辑：价格强度 > 股债比 > 活跃度 > 波动率
-        final_score = (score_momentum * 0.4) + (score_erp * 0.25) + (score_vol * 0.2) + (score_vix * 0.15)
         
-        # 针对 2026-01-20 的截图进行模型校准
-        # 截图 83 分属于“贪婪”区间
+        # 适配列名 (处理你遇到的 '市盈率1' 变动)
+        pe_col = '市盈率1' if '市盈率1' in df_val.columns else '市盈率TTM'
+        
+        # 合并数据并使用前向填充，防止因节假日不同步导致的 0 分
+        merged = pd.merge(df_val[['日期', pe_col]], df_bond[['日期', '中国国债收益率10年']], on='日期', how='inner')
+        merged = merged.ffill().dropna()
+        
+        # ERP = 1/PE - 国债收益率
+        merged['erp'] = (1 / merged[pe_col].astype(float)) - (merged['中国国债收益率10年'].astype(float) / 100)
+        
+        # ERP越高越安全(低分)，所以得分 = 100 - 百分位
+        score_erp = 100 - get_percentile(merged['erp'], merged['erp'].iloc[-1])
+
+        # --- 4. 股价强度 (当前价格在过去一年中的位置) ---
+        rolling_250_max = df_p['close'].rolling(window=250).max()
+        strength = df_p['close'] / rolling_250_max
+        score_strength = get_percentile(strength, strength.iloc[-1])
+
+        # --- 5. 综合拟合权重 ---
+        # 既然 1月20日是 83 分，说明动量和强度的权重非常高
+        # 动量 45% + 强度 35% + 估值 20%
+        final_score = (score_momentum * 0.45) + (score_strength * 0.35) + (score_erp * 0.20)
+        
         return {
             "score": int(final_score),
             "momentum": int(score_momentum),
             "erp": int(score_erp),
-            "label": "🔥 贪婪" if final_score > 60 else "❄️ 恐惧" if final_score < 40 else "😐 中性"
+            "strength": int(score_strength),
+            "date": datetime.now().strftime('%Y-%m-%d')
         }
     except Exception as e:
-        print(f"算法执行错误: {e}")
+        print(f"模型计算失败详情: {str(e)}")
         return None
 
-def send_feishu(res):
+def send_to_feishu(res):
     if not res: return
-    # 关键词必须包含：指数
+    
+    # 标题必须包含关键词：指数
+    title = f"📊 韭圈儿恐贪指数同步提醒 ({res['date']})"
+    # 颜色策略：>60红(贪婪), <40蓝(恐惧)
+    color = "red" if res['score'] > 60 else "blue"
+    
+    # 构建卡片内容
+    elements = [
+        {
+            "tag": "div",
+            "text": {
+                "tag": "lark_md", 
+                "content": f"**当前指数：{res['score']}**\n指数属性：**{'🔥 贪婪' if res['score']>60 else '❄️ 恐惧'}**\n\n"
+                           f"**维度拆解：**\n"
+                           f"- 🚀 动量热度分位：{res['momentum']} (主导)\n"
+                           f"- 📈 股价强度分位：{res['strength']}\n"
+                           f"- 🛡️ 股债性价比分位：{res['erp']} (底层)"
+            }
+        },
+        {"tag": "hr"},
+        {
+            "tag": "note",
+            "elements": [{"tag": "plain_text", "content": "注：基于价格动能、一年股价分位及 ERP 综合拟合，对标韭圈儿 App 指标。"}]
+        }
+    ]
+
     payload = {
         "msg_type": "interactive",
         "card": {
-            "header": {"title": {"tag": "plain_text", "content": "📈 韭圈儿恐贪指数 (本土化拟合版)"}, "template": "red" if res['score'] > 60 else "blue"},
-            "elements": [
-                {"tag": "div", "text": {"tag": "lark_md", "content": f"**当前指数数值：{res['score']}**\n指数属性：**{res['label']}**\n\n**子指标拆解：**\n- 股价动能分位：{res['momentum']} (核心驱动)\n- 股债性价比分位：{res['erp']} (底层安全垫)\n\n<font color='grey'>注：本指标通过量化波动率、动能、估值合成，对标韭圈儿情绪模型。</font>"}}
-            ]
+            "header": {"title": {"tag": "plain_text", "content": title}, "template": color},
+            "elements": elements
         }
     }
+    
     r = requests.post(FEISHU_WEBHOOK, json=payload)
-    print(f"发送状态: {r.status_code}")
+    print(f"飞书发送结果: {r.status_code}, {r.text}")
 
 if __name__ == "__main__":
-    result = analyze_jiuquan_v3()
-    send_feishu(result)
+    result = analyze_jiuquan_final()
+    if result:
+        send_to_feishu(result)
