@@ -29,16 +29,18 @@ def analyze_ashare():
         # 获取估值数据
         df_val = ak.stock_zh_index_value_csindex(symbol="000300")
         
-        # 兼容性修复：自动寻找包含 '市盈率' 或 'PE' 的列
-        pe_col = [c for c in df_val.columns if '市盈率' in c and 'TTM' in c]
-        date_col = [c for c in df_val.columns if '日期' in c or 'date' in c]
-        
-        if not pe_col or not date_col:
-            print(f"找不到 PE 或 日期列。当前列名: {df_val.columns.tolist()}")
+        # 精准匹配：根据日志，接口返回的是 '市盈率1' (滚动PE)
+        # 我们优先使用 '市盈率1'，如果不存在则找包含 '市盈率' 的列
+        pe_cols = [c for c in ['市盈率1', '市盈率2'] if c in df_val.columns]
+        if not pe_cols:
+            pe_cols = [c for c in df_val.columns if '市盈率' in c]
+            
+        if not pe_cols:
+            print(f"未能识别PE列。当前列名: {df_val.columns.tolist()}")
             return None
             
-        df_val[date_col[0]] = pd.to_datetime(df_val[date_col[0]])
-        df_val.set_index(date_col[0], inplace=True)
+        df_val['日期'] = pd.to_datetime(df_val['日期'])
+        df_val.set_index('日期', inplace=True)
         
         # 获取10年期国债收益率
         df_bond = ak.bond_zh_us_rate()
@@ -46,10 +48,10 @@ def analyze_ashare():
         df_bond.set_index('日期', inplace=True)
         
         merged = pd.DataFrame()
-        merged['pe'] = df_val[pe_col[0]]
+        merged['pe'] = df_val[pe_cols[0]]
         merged = merged.join(df_bond['中国国债收益率10年'], how='inner')
         
-        # 计算利差 (ERP)
+        # 计算股债利差 (ERP)
         merged['spread'] = (1 / merged['pe']) - (merged['中国国债收益率10年'] / 100)
         
         current_spread = merged['spread'].iloc[-1]
@@ -103,7 +105,7 @@ def send_feishu(results):
         })
         elements.append({"tag": "hr"})
 
-    # 这里的标题包含“恐贪”和“指数”，请确保飞书后台有其中一个关键词
+    # 固定包含关键词：恐贪指数
     payload = {
         "msg_type": "interactive",
         "card": {
@@ -126,4 +128,4 @@ if __name__ == "__main__":
     if final_results:
         send_feishu(final_results)
     else:
-        print("计算全部失败，无法发送")
+        print("计算失败，无法发送")
