@@ -210,3 +210,7 @@ if __name__ == "__main__":
     
     if results:
         send_feishu(results)
+    if not FEISHU_WEBHOOK:
+    print("错误：未检测到环境变量 FEISHU_WEBHOOK")
+else:
+    print(f"检测到 Webhook，长度为: {len(FEISHU_WEBHOOK)}")
