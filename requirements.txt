@@ -1,0 +1,7 @@
+akshare
+yfinance
+pandas
+numpy
+requests
+scipy
+lxml
