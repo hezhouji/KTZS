@@ -61,25 +61,47 @@ def send_feishu(title, text, color="blue"):
     requests.post(FEISHU_WEBHOOK, json=payload)
 
 def calculate_score(target_date, df_p, df_val, df_bond):
-    """核心计算模型"""
+    """核心计算模型 - 增强容错版"""
     try:
-        df_curr = df_p[df_p['date'] <= target_date].copy()
-        # 1. 动能
-        h250 = df_curr['close'].rolling(250).max()
-        s_score = stats.percentileofscore(df_curr['close']/h250, (df_curr['close']/h250).iloc[-1])
-        # 2. 量能
-        v20 = df_curr['volume'].rolling(20).mean()
-        v_score = stats.percentileofscore(df_curr['volume']/v20, (df_curr['volume']/v20).iloc[-1])
-        # 3. 股债
-        pe_col = '市盈率1' if '市盈率1' in df_val.columns else '市盈率TTM'
-        merged = pd.merge(df_val[['date_key', pe_col]], df_bond[['date_key', '中国国债收益率10年']], on='date_key')
-        merged = merged[merged['date_key'] <= target_date]
-        merged['erp'] = (1 / merged[pe_col].astype(float)) - (merged['中国国债收益率10年'].astype(float) / 100)
-        e_score = 100 - stats.percentileofscore(merged['erp'], merged['erp'].iloc[-1])
+        # 截取数据并过滤空值
+        df_curr = df_p[df_p['date'] <= target_date].dropna(subset=['close', 'volume']).copy()
+        if df_curr.empty: return None
         
-        return round((s_score * 0.4 + v_score * 0.3 + e_score * 0.3), 2)
-    except: return None
+        # 1. 动能 (处理可能的空值)
+        h250 = df_curr['close'].rolling(250, min_periods=1).max()
+        curr_ratio = df_curr['close'].iloc[-1] / h250.iloc[-1]
+        s_score = stats.percentileofscore((df_curr['close']/h250).dropna(), curr_ratio)
+        
+        # 2. 量能
+        v20 = df_curr['volume'].rolling(20, min_periods=1).mean()
+        curr_v_ratio = df_curr['volume'].iloc[-1] / v20.iloc[-1]
+        v_score = stats.percentileofscore((df_curr['volume']/v20).dropna(), curr_v_ratio)
+        
+        # 3. 股债 (ERP) - 容易出 nan 的重灾区
+        pe_col = '市盈率1' if '市盈率1' in df_val.columns else '市盈率TTM'
+        # 强制转换类型并处理空值
+        df_val[pe_col] = pd.to_numeric(df_val[pe_col], errors='coerce')
+        df_bond['中国国债收益率10年'] = pd.to_numeric(df_bond['中国国债收益率10年'], errors='coerce')
+        
+        merged = pd.merge(df_val[['date_key', pe_col]], df_bond[['date_key', '中国国债收益率10年']], on='date_key').dropna()
+        merged = merged[merged['date_key'] <= target_date]
+        
+        if not merged.empty:
+            merged['erp'] = (1 / merged[pe_col]) - (merged['中国国债收益率10年'] / 100)
+            e_score = 100 - stats.percentileofscore(merged['erp'], merged['erp'].iloc[-1])
+        else:
+            log("ERP数据匹配为空，使用默认分50")
+            e_score = 50
 
+        # 加权计算，并使用 np.nan_to_num 兜底
+        raw = (np.nan_to_num(s_score) * 0.4 + 
+               np.nan_to_num(v_score) * 0.3 + 
+               np.nan_to_num(e_score) * 0.3)
+        
+        return round(raw, 2)
+    except Exception as e:
+        log(f"因子计算崩裂: {e}")
+        return None
 def main():
     log("=== 启动具备周末感知能力的分析流程 ===")
     today = datetime.now().date()
