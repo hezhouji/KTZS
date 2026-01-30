@@ -1,24 +1,22 @@
-name: Daily Index Predictor
+name: KTZS_Auto_Predictor
 
 on:
   schedule:
-    - cron: '0 9 * * 1-5' # 周一至周五北京时间下午5点运行（UTC 9:00）
-  workflow_dispatch:
+    - cron: '0 9 * * 1-5' # 北京时间下午5点运行
+  workflow_dispatch: # 允许手动点击运行
 
 jobs:
-  build:
+  predict:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # 赋予写入权限，以便写回 CSV 文件
+      contents: write # 必须开启写入权限才能保存 HISTORY_LOG.csv
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
-        with:
-          persist-credentials: true
 
       - name: Set up Python
-        uses: ambassadors/setup-python@v4
+        uses: actions/setup-python@v4 # 修正了之前的拼写错误
         with:
           python-version: '3.9'
 
@@ -35,11 +33,11 @@ jobs:
         run: |
           git config --global user.name "GitHub Action"
           git config --global user.email "action@github.com"
-          # 检查是否有文件更新（HISTORY_LOG.csv）
           git add HISTORY_LOG.csv
+          # 只有在文件有变动时才提交，防止报错
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "Update history log [skip ci]"
+            git commit -m "自动更新历史记录 [skip ci]"
             git push
           fi
