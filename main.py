@@ -123,18 +123,28 @@ def main():
     df_log.sort_values('date').to_csv(LOG_FILE, index=False)
     
     # 飞书推送
-    w_str = " | ".join([f"{n}:{w:.0%}" for n, w in zip(["波动","量能","强度","期货","避险","杠杆"], weights)])
+# 在 main.py 的 main() 函数末尾替换这段推送逻辑
+    # ... 之前的代码保持不变 ...
+
+    # 构建推送内容
+    w_info = " | ".join([f"{n}:{w:.0%}" for n, w in zip(["波动","量能","强度","期货","避险","杠杆"], weights)])
     payload = {
         "msg_type": "interactive",
         "card": {
             "header": {"title": {"tag": "plain_text", "content": f"🎯 恐贪 AI 预测 ({today})"}, "template": "purple"},
             "elements": [
-                {"tag": "div", "text": {"tag": "lark_md", "content": f"**最终预测值：{tp}**\n\n📊 **动态权重对齐现状：**\n{w_str}"}},
-                {"tag": "note", "elements": [{"tag": "plain_text", "content": f"因子原始分: {' / '.join(map(str, tf))}"}]}
+                {"tag": "div", "text": {"tag": "lark_md", "content": f"**今日预测值：{tp}**\n\n📊 **权重对齐现状：**\n{w_info}"}},
+                {"tag": "note", "elements": [{"tag": "plain_text", "content": f"原始维度分: {' / '.join(map(str, tf))}"}]}
             ]
         }
     }
-    requests.post(FEISHU_WEBHOOK, json=payload)
+    
+    if FEISHU_WEBHOOK:
+        response = requests.post(FEISHU_WEBHOOK, json=payload)
+        print(f"飞书推送状态码: {response.status_code}")
+        print(f"飞书返回详情: {response.text}")
+    else:
+        print("错误: 未检测到 FEISHU_WEBHOOK 环境变量")
 
 if __name__ == "__main__":
     main()
