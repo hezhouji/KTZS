@@ -1,39 +1,48 @@
-name: KTZS_Auto_Predictor
+name: KTZS_AI_Predictor
 
 on:
   schedule:
-    - cron: '0 9 * * 1-5' # 北京时间下午5点运行
-  workflow_dispatch: # 允许手动点击运行
+    # 国际标准时间 09:35 是北京时间 17:35
+    - cron: '35 9 * * 1-5'
+  workflow_dispatch: # 允许你手动点击运行
 
 jobs:
-  predict:
+  build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 必须开启写入权限才能保存 HISTORY_LOG.csv
+      contents: write  # 必须赋予写入权限以更新 CSV
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
+        with:
+          persist-credentials: true
 
       - name: Set up Python
-        uses: actions/setup-python@v4 # 修正了之前的拼写错误
+        uses: actions/set-up-python@v4
         with:
           python-version: '3.9'
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install akshare pandas numpy scipy requests
 
-      - name: Run analysis
+      - name: Run Analysis
         env:
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
         run: python main.py
 
-      - name: Commit and push changes
-       run: |
-        git config --local user.name "GitHub Action"
-        git config --local user.email "action@github.com"
-        git add HISTORY_LOG.csv || true  # 即使文件不存在也不报错
-        git commit -m "Update history and prediction" || echo "No changes to commit"
-        git push || echo "No changes to push"
+      - name: Commit and Push changes
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          # 检查是否有文件变动
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "自动更新历史数据及权重对齐 [$(date +'%Y-%m-%d')]"
+            git push origin HEAD
           fi
