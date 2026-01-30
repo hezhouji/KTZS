@@ -7,7 +7,7 @@ import requests
 import os
 from datetime import datetime, timedelta
 
-# --- 配置 ---
+# --- 基础配置 ---
 FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK")
 DATA_DIR = "KTZS"
 LOG_FILE = "HISTORY_LOG.csv"
@@ -15,15 +15,21 @@ LOG_FILE = "HISTORY_LOG.csv"
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
+def is_workday(d_obj):
+    return d_obj.weekday() < 5
+
 def normalize_date(d_val):
-    """确保日期统一，解决图中格式混乱问题"""
+    """强制清洗日期格式为 YYYY-MM-DD"""
+    if not d_val or pd.isna(d_val): return None
     s = str(d_val).replace(".txt", "").replace("年", "-").replace("月", "-").replace("日", "")
     for fmt in ("%Y-%m-%d", "%Y%m%d"):
-        try: return datetime.strptime(s, fmt).date()
+        try:
+            return datetime.strptime(s, fmt).date()
         except: continue
     return None
 
-def get_actual(date_obj):
+def get_actual_val(date_obj):
+    """从 KTZS 文件夹匹配补录的真实值"""
     target = date_obj.strftime("%Y%m%d")
     if not os.path.exists(DATA_DIR): return None
     for f in os.listdir(DATA_DIR):
@@ -35,49 +41,68 @@ def get_actual(date_obj):
     return None
 
 def calculate_factors(target_date, df_p_all, df_val_all, df_bond_all):
-    """严格历史回溯计算，确保每天得分不同"""
+    """带严格时间切片的六维度模型"""
     try:
-        # 只取目标日期及之前的数据
+        # 只保留目标日期及之前的数据
         df_p = df_p_all[df_p_all['date'] <= target_date].copy()
         df_val = df_val_all[df_val_all['date_key'] <= target_date].copy()
         df_bond = df_bond_all[df_bond_all['date_key'] <= target_date].copy()
+        
+        if len(df_p) < 30: return [50.0] * 6
 
-        if len(df_p) < 30: return [50.0]*6
-
-        def p_score(series, cur, inv=False):
-            p = stats.percentileofscore(series.dropna(), cur)
+        def get_p(series, cur, inv=False):
+            series = pd.to_numeric(series, errors='coerce').dropna()
+            if series.empty or np.isnan(cur): return 50.0
+            p = stats.percentileofscore(series, cur, kind='weak')
             return float(100 - p if inv else p)
 
-        # 核心因子计算
-        v = df_p['close'].pct_change().rolling(20).std()
-        f1 = p_score(v, v.iloc[-1], inv=True)
+        # f1: 指数波动 (20日)
+        vol = df_p['close'].pct_change().rolling(20).std()
+        f1 = get_p(vol, vol.iloc[-1], inv=True)
+        
+        # f2: 总成交量 (20日比)
         v20 = df_p['volume'].rolling(20).mean()
-        f2 = p_score(df_p['volume']/v20, (df_p['volume']/v20).iloc[-1])
+        f2 = get_p(df_p['volume'] / v20, (df_p['volume'] / v20).iloc[-1])
+        
+        # f3: 股价强度 (250日高点位置)
         h250 = df_p['close'].rolling(250).max()
-        f3 = p_score(df_p['close']/h250, (df_p['close']/h250).iloc[-1])
-        f4 = 50.0 # 模拟基差
-        pe_col = '市盈率1' if '市盈率1' in df_val.columns else '市盈率TTM'
-        erp = (1/df_val[pe_col].astype(float)) - (df_bond['中国国债收益率10年'].astype(float)/100)
-        f5 = p_score(erp, erp.iloc[-1], inv=True)
-        f6 = 50.0 # 模拟杠杆
+        f3 = get_p(df_p['close'] / h250, (df_p['close'] / h250).iloc[-1])
+        
+        # f4: 升贴水率 (基差模拟)
+        f4 = 50.0 
+        
+        # f5: 避险天堂 (ERP 股债性价比) - 深度兼容性修复
+        pe_val = None
+        for col in ['市盈率1', '市盈率TTM', '市盈率']:
+            if col in df_val.columns:
+                pe_val = pd.to_numeric(df_val[col], errors='coerce')
+                break
+        
+        bond_rate = None
+        for col in ['中国国债收益率10年', 'rate', '收益率']:
+            if col in df_bond.columns:
+                bond_rate = pd.to_numeric(df_bond[col], errors='coerce') / 100
+                break
+
+        if pe_val is not None and bond_rate is not None:
+            erp_series = (1 / pe_val) - bond_rate
+            f5 = get_p(erp_series, erp_series.iloc[-1], inv=True)
+        else:
+            f5 = 50.0 # 兜底逻辑
+
+        # f6: 杠杆水平
+        f6 = 50.0 
 
         return [round(x, 2) for x in [f1, f2, f3, f4, f5, f6]]
-    except: return [50.0]*6
+    except Exception as e:
+        log(f"因子计算失败: {e}")
+        return [50.0] * 6
 
 def main():
-    log("=== 启动 AI 自适应预测系统 ===")
+    log("=== 启动具备自动进化能力的恐贪 AI 系统 ===")
     today = datetime.now().date()
-    cols = ["日期", "f1", "f2", "f3", "f4", "f5", "f6", "预测", "实际的", "偏见"]
-
-    # 读取并强行清洗旧 CSV
-    if os.path.exists(LOG_FILE):
-        df_log = pd.read_csv(LOG_FILE)
-        if not df_log.empty:
-            df_log['日期'] = df_log['日期'].apply(lambda x: normalize_date(x).strftime("%Y-%m-%d") if normalize_date(x) else x)
-    else:
-        df_log = pd.DataFrame(columns=cols)
-
-    # 获取全量市场数据
+    
+    # 1. 抓取全量市场数据
     df_p = ak.stock_zh_index_daily(symbol="sh000300")
     df_p['date'] = pd.to_datetime(df_p['date']).dt.date
     df_val = ak.stock_zh_index_value_csindex(symbol="000300")
@@ -85,60 +110,72 @@ def main():
     df_bond = ak.bond_zh_us_rate()
     df_bond['date_key'] = pd.to_datetime(df_bond['日期']).dt.date
 
-    # 1. 补全历史与对齐（处理不完整数据）
+    # 2. 初始化 CSV 记录
+    cols = ["date", "f1", "f2", "f3", "f4", "f5", "f6", "predict", "actual", "bias"]
+    if os.path.exists(LOG_FILE):
+        try:
+            df_log = pd.read_csv(LOG_FILE)
+            if not df_log.empty:
+                df_log['date'] = df_log['date'].apply(lambda x: normalize_date(x).strftime("%Y-%m-%d") if normalize_date(x) else x)
+        except: df_log = pd.DataFrame(columns=cols)
+    else:
+        df_log = pd.DataFrame(columns=cols)
+
+    # 3. 补全历史与误差计算 (回溯最近 14 天)
     for i in range(14, 0, -1):
         d = today - timedelta(days=i)
-        act = get_actual(d)
-        if act:
+        if not is_workday(d): continue
+        act = get_actual_val(d)
+        if act is not None:
             d_str = d.strftime("%Y-%m-%d")
             fs = calculate_factors(d, df_p, df_val, df_bond)
-            p_avg = round(sum(fs)/6, 2)
-            df_log = df_log[df_log['日期'] != d_str]
-            df_log.loc[len(df_log)] = [d_str] + fs + [p_avg, act, round(act - p_avg, 2)]
+            p_raw = round(sum(fs) / 6, 2)
+            df_log = df_log[df_log['date'] != d_str]
+            df_log.loc[len(df_log)] = [d_str] + fs + [p_raw, act, round(act - p_raw, 2)]
 
-    # 2. 权重进化
-    weights = np.array([1/6]*6)
-    df_fit = df_log.dropna(subset=['实际的']).tail(7)
-    if len(df_fit) >= 5: # 降低门槛，有5天数据就开始对齐
-        X, y = df_fit[['f1','f2','f3','f4','f5','f6']].values, df_fit['实际的'].values
-        res = minimize(lambda w: np.sum((X@w - y)**2), weights, bounds=[(0.05, 0.4)]*6, constraints={'type':'eq','fun':lambda w: sum(w)-1})
+    # 4. 动态权重优化 (最小二乘法)
+    weights = np.array([1/6] * 6)
+    df_fit = df_log.dropna(subset=['actual']).tail(7)
+    if len(df_fit) >= 5:
+        X = df_fit[['f1', 'f2', 'f3', 'f4', 'f5', 'f6']].values
+        y = df_fit['actual'].values
+        res = minimize(lambda w: np.sum((X @ w - y)**2), weights, bounds=[(0.05, 0.4)]*6, constraints={'type':'eq','fun':lambda w: sum(w)-1})
         if res.success: weights = res.x
 
-    # 3. 今日预测（解决 nan 问题）
-    tf = calculate_factors(today, df_p, df_val, df_bond)
-    tp = round(sum(f*w for f, w in zip(tf, weights)), 2)
+    # 5. 今日预测及误差对齐
+    today_factors = calculate_factors(today, df_p, df_val, df_bond)
+    today_raw = round(sum(f * w for f, w in zip(today_factors, weights)), 2)
     
-    # 误差修正容错逻辑
-    bias_val = 0.0
-    bias_desc = "无"
-    if not df_log.dropna(subset=['偏见']).empty:
-        last_bias = df_log.dropna(subset=['偏见']).iloc[-1]['偏见']
-        if not np.isnan(last_bias):
-            bias_val = last_bias
-            bias_desc = f"{'+' if last_bias>=0 else ''}{last_bias}"
+    bias_fix = 0.0
+    if not df_fit.empty:
+        last_b = df_fit.iloc[-1]['bias']
+        if not np.isnan(last_b): bias_fix = last_b
+    
+    final_predict = round(today_raw + bias_fix, 2)
 
-    final_val = round(tp + bias_val, 2)
-    
+    # 记录今日数据
     t_str = today.strftime("%Y-%m-%d")
-    df_log = df_log[df_log['日期'] != t_str]
-    df_log.loc[len(df_log)] = [t_str] + tf + [tp, np.nan, np.nan]
-    df_log.sort_values('日期').to_csv(LOG_FILE, index=False)
+    df_log = df_log[df_log['date'] != t_str]
+    df_log.loc[len(df_log)] = [t_str] + today_factors + [today_raw, np.nan, np.nan]
+    df_log.sort_values('date').to_csv(LOG_FILE, index=False)
 
-    # 4. 飞书推送（解决关键词拦截）
-    w_info = " | ".join([f"{n}:{w:.0%}" for n, w in zip(["波动","量能","强度","期货","避险","杠杆"], weights)])
+    # 6. 飞书卡片推送
+    w_detail = " | ".join([f"{n}:{w:.0%}" for n, w in zip(["波动","量能","强度","期货","避险","杠杆"], weights)])
     payload = {
         "msg_type": "interactive",
         "card": {
-            "header": {"title": {"tag": "plain_text", "content": f"🎯 恐贪指数 AI 预测 ({today})"}, "template": "purple"},
+            "header": {"title": {"tag": "plain_text", "content": f"🎯 恐贪 AI 指数预测报告 ({today})"}, "template": "purple"},
             "elements": [
-                {"tag": "div", "text": {"tag": "lark_md", "content": f"**今日建议值：{final_val}**\n原生：{tp} | 修正：{bias_desc}\n\n📊 **权重对齐：**\n{w_info}"}},
-                {"tag": "note", "elements": [{"tag": "plain_text", "content": "关键词：恐贪"}]}
+                {"tag": "div", "text": {"tag": "lark_md", "content": f"**今日建议值：{final_predict}**\n原生分：{today_raw} | 修正值：{bias_fix:+.1f}\n\n📊 **AI 权重进化详情：**\n{w_detail}"}},
+                {"tag": "hr"},
+                {"tag": "note", "elements": [{"tag": "plain_text", "content": f"维度得分: {' / '.join(map(str, today_factors))} | 搜索词: 恐贪"}]}
             ]
         }
     }
+    
     if FEISHU_WEBHOOK:
         r = requests.post(FEISHU_WEBHOOK, json=payload)
-        log(f"推送状态: {r.status_code} {r.text}")
+        log(f"飞书推送结果: {r.status_code}, {r.text}")
 
 if __name__ == "__main__":
     main()
