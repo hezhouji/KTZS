@@ -6,7 +6,7 @@ import requests
 import os
 from datetime import datetime, timedelta
 
-# 配置
+# --- 配置区 ---
 FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK")
 DATA_DIR = "KTZS"
 LOG_FILE = "HISTORY_LOG.csv"
@@ -15,30 +15,27 @@ def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 def is_workday(date):
-    """简单判断是否为工作日（跳过周六日）"""
+    """判断是否为工作日（跳过周六日）"""
     return date.weekday() < 5
 
-def get_target_dates(today):
-    """
-    逻辑：如果是周一，我们需要前一天的数据（上周五）
-    如果是周二到周五，我们需要前一天（周一到周四）
-    """
-    yest = today - timedelta(days=1)
-    while not is_workday(yest):
-        yest -= timedelta(days=1)
-    return yest
-
 def get_actual_val(date_obj):
+    """从文件夹读取实际值"""
     date_str = date_obj.strftime("%Y%m%d")
     path = os.path.join(DATA_DIR, f"{date_str}.txt")
     if os.path.exists(path):
         try:
             with open(path, "r") as f:
-                return float(f.read().strip())
+                content = f.read().strip()
+                return float(content) if content else None
         except: return None
     return None
 
 def save_to_history(date_str, raw, bias, final):
+    """持久化记录，自动过滤 nan"""
+    if np.isnan(raw) or np.isnan(bias) or np.isnan(final):
+        log(f"⚠️ 拒绝记录异常数据: {date_str}")
+        return
+
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, "w") as f:
             f.write("date,raw_score,bias,final_prediction\n")
@@ -47,10 +44,12 @@ def save_to_history(date_str, raw, bias, final):
     if str(date_str) not in df['date'].values.astype(str):
         with open(LOG_FILE, "a") as f:
             f.write(f"{date_str},{raw:.2f},{bias:.2f},{final:.2f}\n")
-        log(f"✅ 已存证 {date_str}")
+        log(f"✅ 历史存档成功: {date_str}")
 
 def send_feishu(title, text, color="blue"):
-    if not FEISHU_WEBHOOK: return
+    if not FEISHU_WEBHOOK:
+        log("未检测到 Webhook，跳过推送")
+        return
     payload = {
         "msg_type": "interactive",
         "card": {
@@ -58,28 +57,29 @@ def send_feishu(title, text, color="blue"):
             "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": text}}]
         }
     }
-    requests.post(FEISHU_WEBHOOK, json=payload)
+    try:
+        res = requests.post(FEISHU_WEBHOOK, json=payload, timeout=10)
+        log(f"飞书推送状态: {res.status_code}")
+    except Exception as e:
+        log(f"推送失败: {e}")
 
 def calculate_score(target_date, df_p, df_val, df_bond):
-    """核心计算模型 - 增强容错版"""
+    """核心因子模型：股价强度 + 成交量能 + 股债性价比"""
     try:
-        # 截取数据并过滤空值
+        # 截取数据
         df_curr = df_p[df_p['date'] <= target_date].dropna(subset=['close', 'volume']).copy()
         if df_curr.empty: return None
         
-        # 1. 动能 (处理可能的空值)
-        h250 = df_curr['close'].rolling(250, min_periods=1).max()
-        curr_ratio = df_curr['close'].iloc[-1] / h250.iloc[-1]
-        s_score = stats.percentileofscore((df_curr['close']/h250).dropna(), curr_ratio)
+        # 1. 股价强度 (250日分位)
+        h250 = df_curr['close'].rolling(250, min_periods=30).max()
+        s_score = stats.percentileofscore((df_curr['close']/h250).dropna(), (df_curr['close']/h250).iloc[-1])
         
-        # 2. 量能
-        v20 = df_curr['volume'].rolling(20, min_periods=1).mean()
-        curr_v_ratio = df_curr['volume'].iloc[-1] / v20.iloc[-1]
-        v_score = stats.percentileofscore((df_curr['volume']/v20).dropna(), curr_v_ratio)
+        # 2. 成交量能 (20日均量比)
+        v20 = df_curr['volume'].rolling(20, min_periods=5).mean()
+        v_score = stats.percentileofscore((df_curr['volume']/v20).dropna(), (df_curr['volume']/v20).iloc[-1])
         
-        # 3. 股债 (ERP) - 容易出 nan 的重灾区
+        # 3. 股债性价比 (ERP)
         pe_col = '市盈率1' if '市盈率1' in df_val.columns else '市盈率TTM'
-        # 强制转换类型并处理空值
         df_val[pe_col] = pd.to_numeric(df_val[pe_col], errors='coerce')
         df_bond['中国国债收益率10年'] = pd.to_numeric(df_bond['中国国债收益率10年'], errors='coerce')
         
@@ -90,27 +90,27 @@ def calculate_score(target_date, df_p, df_val, df_bond):
             merged['erp'] = (1 / merged[pe_col]) - (merged['中国国债收益率10年'] / 100)
             e_score = 100 - stats.percentileofscore(merged['erp'], merged['erp'].iloc[-1])
         else:
-            log("ERP数据匹配为空，使用默认分50")
             e_score = 50
 
-        # 加权计算，并使用 np.nan_to_num 兜底
+        # 加权求和，防御性处理 nan
         raw = (np.nan_to_num(s_score) * 0.4 + 
                np.nan_to_num(v_score) * 0.3 + 
                np.nan_to_num(e_score) * 0.3)
         
-        return round(raw, 2)
+        return round(float(raw), 2)
     except Exception as e:
-        log(f"因子计算崩裂: {e}")
+        log(f"因子计算报错: {e}")
         return None
+
 def main():
-    log("=== 启动具备周末感知能力的分析流程 ===")
+    log("=== 启动 KTZS 智能预测系统 ===")
     today = datetime.now().date()
     if not is_workday(today):
-        log("今日非交易日，跳过。")
+        log("休市日，程序退出")
         return
 
-    # 1. 拉取数据
-    log("同步市场数据...")
+    # 1. 加载数据
+    log("正在同步 AkShare 市场数据...")
     df_p = ak.stock_zh_index_daily(symbol="sh000300")
     df_p['date'] = pd.to_datetime(df_p['date']).dt.date
     df_val = ak.stock_zh_index_value_csindex(symbol="000300")
@@ -118,9 +118,8 @@ def main():
     df_bond = ak.bond_zh_us_rate()
     df_bond['date_key'] = pd.to_datetime(df_bond['日期']).dt.date
 
-    # 2. 补算与报警逻辑
-    # 检查过去5个工作日是否有待补录数据
-    last_bias = 0
+    # 2. 补算与缺失报警 (回溯5个工作日)
+    last_bias = 0.0
     for i in range(5, 0, -1):
         check_day = today - timedelta(days=i)
         if not is_workday(check_day): continue
@@ -128,26 +127,38 @@ def main():
         actual = get_actual_val(check_day)
         raw = calculate_score(check_day, df_p, df_val, df_bond)
         
-        if actual and raw:
+        if actual is not None and raw is not None:
             bias = actual - raw
             save_to_history(check_day.strftime("%Y-%m-%d"), raw, bias, actual)
-            last_bias = bias # 记录最近一次的有效偏差
+            last_bias = float(bias)
         elif i == 1 or (today.weekday() == 0 and (today - check_day).days <= 3):
-            # 如果是“上一工作日”缺失，发飞书通知
-            if not actual:
-                send_feishu("⚠️ 恐贪指数补录提醒", f"缺失日期: **{check_day}**\n请在 `KTZS/` 文件夹补上传该日数值文件。", "orange")
+            # 只有上一工作日缺失才报警
+            if actual is None:
+                send_feishu("⚠️ 数据缺失补录提醒", f"缺失日期: **{check_day}**\n请尽快在 `KTZS/` 补上传文件。", "orange")
 
-    # 3. 今日预测
+    # 3. 预测逻辑：从日志获取最新的有效偏差
+    if os.path.exists(LOG_FILE):
+        try:
+            df_h = pd.read_csv(LOG_FILE).dropna(subset=['bias'])
+            # 过滤掉存为字符串的 "nan"
+            df_h = df_h[df_h['bias'].apply(lambda x: str(x).lower() != 'nan')]
+            if not df_h.empty:
+                last_bias = float(df_h['bias'].iloc[-1])
+        except: pass
+
+    # 4. 执行今日预测
     today_raw = calculate_score(today, df_p, df_val, df_bond)
-    if today_raw:
-        # 如果历史记录里有最近的偏差，直接使用
-        if os.path.exists(LOG_FILE):
-            df_h = pd.read_csv(LOG_FILE)
-            if not df_h.empty: last_bias = df_h['bias'].iloc[-1]
-            
-        final = round(today_raw + last_bias, 2)
+    if today_raw is not None and not np.isnan(today_raw):
+        final_prediction = round(today_raw + last_bias, 2)
+        log(f"预测完成: {final_prediction}")
+        
         send_feishu(f"📊 恐贪指数预测 ({today})", 
-                    f"**预测值：{final}**\n原生：{today_raw} | 修正：{last_bias:+.2f}\n\n*注：已自动对齐上一工作日误差。*", "blue")
+                    f"**今日推测值：{final_prediction}**\n"
+                    f"模型原生：{today_raw:.2f}\n"
+                    f"偏差修正：{last_bias:+.2f}\n\n"
+                    f"*注：系统已自动识别并跳过周末数据干扰。*", "blue")
+    else:
+        log("今日模型计算失败，可能数据源未更新")
 
 if __name__ == "__main__":
     main()
