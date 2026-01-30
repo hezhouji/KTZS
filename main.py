@@ -6,9 +6,26 @@ import requests
 import os
 from datetime import datetime, timedelta
 
-# 配置
+# 飞书配置
 FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK")
 DATA_DIR = "KTZS"
+
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+def get_actual_val(date_str):
+    path = os.path.join(DATA_DIR, f"{date_str}.txt")
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                val = float(f.read().strip())
+                log(f"成功读取昨日实际值: {val}")
+                return val
+        except Exception as e:
+            log(f"读取文件内容失败: {e}")
+    else:
+        log(f"未找到昨日校准文件: {path}")
+    return None
 
 def get_p_score(series, current_val, reverse=False):
     series = series.dropna()
@@ -16,96 +33,122 @@ def get_p_score(series, current_val, reverse=False):
     p = stats.percentileofscore(series, current_val, kind='weak')
     return 100 - p if reverse else p
 
-def get_actual_val(date_str):
-    """从 KTZS/YYYYMMDD.txt 获取昨日韭圈儿实际值"""
-    path = os.path.join(DATA_DIR, f"{date_str}.txt")
-    if os.path.exists(path):
-        try:
-            with open(path, "r") as f:
-                return float(f.read().strip())
-        except: return None
-    return None
-
-def analyze_full_factors(target_date, df_p, df_val, df_bond):
-    """全因子扫描模型"""
+def analyze_factors(target_date, df_p, df_val, df_bond):
+    log(f"正在分析日期 {target_date} 的多维度因子...")
     try:
-        # 截取历史数据
         df_curr = df_p[df_p['date'] <= target_date].copy()
-        
-        # 1. 价格动能 (权重: 0.3)
+        if df_curr.empty: return None
+
+        # 1. 动能 (250日位置)
         h250 = df_curr['close'].rolling(250).max()
         s_score = get_p_score(df_curr['close']/h250, (df_curr['close']/h250).iloc[-1])
         
-        # 2. 成交量能 (权重: 0.2)
+        # 2. 量能 (20日均量比)
         v20 = df_curr['volume'].rolling(20).mean()
         v_score = get_p_score(df_curr['volume']/v20, (df_curr['volume']/v20).iloc[-1])
         
-        # 3. 股债性价比 (权重: 0.15)
-        # (复用之前的日期匹配逻辑计算 ERP)
+        # 3. 股债 (ERP)
         pe_col = '市盈率1' if '市盈率1' in df_val.columns else '市盈率TTM'
-        e_score = 50 # 默认
-        
-        # 4. 模拟新增因子：全市场赚钱效应 (权重: 0.2)
-        # 获取当日涨跌家数 (以此模拟截图中的'股价强度')
-        try:
-            df_adv = ak.stock_zh_a_spot_em()
-            up_count = len(df_adv[df_adv['涨跌幅'] > 0])
-            score_market = (up_count / len(df_adv)) * 100
-        except: score_market = 50
+        # 简单匹配当日ERP
+        merged = pd.merge(df_val[['date_key', pe_col]], df_bond[['date_key', '中国国债收益率10年']], on='date_key')
+        merged = merged[merged['date_key'] <= target_date]
+        if not merged.empty:
+            merged['erp'] = (1 / merged[pe_col].astype(float)) - (merged['中国国债收益率10年'].astype(float) / 100)
+            e_score = get_p_score(merged['erp'], merged['erp'].iloc[-1], reverse=True)
+        else: e_score = 50
 
-        # 5. 模拟新增因子：杠杆水平/北向流向 (权重: 0.15)
-        # 此处使用 Bias 乖离度作为情绪溢价的替代
+        # 4. 情绪乖离
         bias = (df_curr['close'] - df_curr['close'].rolling(20).mean()) / df_curr['close'].rolling(20).mean()
-        score_bias = get_p_score(bias, bias.iloc[-1])
+        b_score = get_p_score(bias, bias.iloc[-1])
 
-        # 原始加权总分 (Raw)
-        raw = (s_score * 0.3) + (v_score * 0.2) + (score_market * 0.2) + (score_bias * 0.15) + (15) # 基础分补正
-        
-        return {"raw": raw, "factors": {"强度": s_score, "量能": v_score, "普涨": score_market, "情绪": score_bias}}
-    except: return None
+        raw = (s_score * 0.4) + (v_score * 0.3) + (e_score * 0.15) + (b_score * 0.15)
+        return {"score": raw, "s": s_score, "v": v_score, "e": e_score, "b": b_score}
+    except Exception as e:
+        log(f"因子计算异常: {e}")
+        return None
+
+def send_feishu(content):
+    if not FEISHU_WEBHOOK:
+        log("错误: 未配置飞书 Webhook 环境变量")
+        return
+    
+    log("正在发送飞书通知...")
+    # 注意：标题必须包含你在飞书机器人后台设置的“关键词”
+    payload = {
+        "msg_type": "interactive",
+        "card": {
+            "header": {"title": {"tag": "plain_text", "content": f"📊 恐贪指数预测同步 ({content['date']})"}, "template": "orange"},
+            "elements": [
+                {"tag": "div", "text": {"tag": "lark_md", "content": f"**今日推测数值：{content['final']}**\n公式：模型({content['raw']}) + 修正({content['bias']})"}},
+                {"tag": "hr"},
+                {"tag": "div", "text": {"tag": "lark_md", "content": f"**归因逻辑：**\n{content['reason']}"}},
+                {"tag": "note", "elements": [{"tag": "plain_text", "content": "注：该预测已根据昨日韭圈儿实际误差自动校准。"}]}
+            ]
+        }
+    }
+    
+    try:
+        res = requests.post(FEISHU_WEBHOOK, json=payload, timeout=10)
+        log(f"飞书返回状态码: {res.status_code}")
+        log(f"飞书返回内容: {res.text}")
+        if res.status_code != 200:
+            log("提示: 请检查飞书机器人安全设置中的'关键词'是否包含【恐贪】或【指数】")
+    except Exception as e:
+        log(f"网络请求失败: {e}")
 
 def main():
+    log("=== 启动自动化分析流程 ===")
     today = datetime.now().date()
-    yest_str = (today - timedelta(days=1)).strftime("%Y%m%d")
+    yest = today - timedelta(days=1)
     
-    # 获取数据
+    log(f"今日日期: {today}, 目标对标日期: {yest}")
+
+    # 1. 抓取数据
+    log("开始拉取 akshare 数据...")
     df_p = ak.stock_zh_index_daily(symbol="sh000300")
     df_p['date'] = pd.to_datetime(df_p['date']).dt.date
     df_val = ak.stock_zh_index_value_csindex(symbol="000300")
+    df_val['date_key'] = pd.to_datetime(df_val['日期']).dt.date
     df_bond = ak.bond_zh_us_rate()
+    df_bond['date_key'] = pd.to_datetime(df_bond['日期']).dt.date
+    log("数据拉取完毕")
+
+    # 2. 计算昨日模型与获取实际值
+    yest_model = analyze_factors(yest, df_p, df_val, df_bond)
+    yest_actual = get_actual_val(yest.strftime("%Y%m%d"))
     
-    # 1. 计算昨日模型值并获取实际值
-    yest_model = analyze_full_factors(today - timedelta(days=1), df_p, df_val, df_bond)
-    yest_actual = get_actual_val(yest_str)
-    
-    # 2. 动态计算今日模型
-    today_model = analyze_full_factors(today, df_p, df_val, df_bond)
-    
-    # 3. 归因修正逻辑
+    # 3. 计算偏差
     bias = 0
-    reason = "继承昨日误差"
+    reason = "继承昨日误差惯性"
     if yest_model and yest_actual:
-        bias = yest_actual - yest_model['raw']
-        
-        # 智能规律推测：
-        # 如果今日成交量暴增 > 30%，则推测情绪有过热溢价，额外增加修正值的 10%
+        bias = yest_actual - yest_model['score']
+        log(f"计算得出偏差: {bias:+.2f}")
+    else:
+        log("警告: 缺少昨日对比数据，修正值为0")
+
+    # 4. 计算今日预测
+    today_model = analyze_factors(today, df_p, df_val, df_bond)
+    if today_model:
+        # 简单环境修正
         vol_change = (df_p['volume'].iloc[-1] / df_p['volume'].iloc[-2]) - 1
-        if vol_change > 0.3:
+        if vol_change > 0.2: 
             bias *= 1.1
-            reason = "成交量异常爆表：调高亢奋系数"
-        elif vol_change < -0.2:
-            bias *= 0.9
-            reason = "成交急剧萎缩：情绪退潮加速"
-
-    final = max(0, min(100, today_model['raw'] + bias))
+            reason = "今日放量显著，强化亢奋偏置"
+        
+        final_val = round(max(0, min(100, today_model['score'] + bias)), 2)
+        log(f"今日最终推测结果: {final_val}")
+        
+        # 5. 发送
+        send_data = {
+            "date": today.strftime("%Y-%m-%d"),
+            "final": final_val,
+            "raw": round(today_model['score'], 2),
+            "bias": round(bias, 2),
+            "reason": reason
+        }
+        send_feishu(send_data)
     
-    # 4. 发送推送
-    send_feishu_final(final, today_model, bias, reason)
-
-def send_feishu_final(final, model, bias, reason):
-    # 构建飞书消息逻辑...
-    print(f"今日预测: {final}, 修正原因: {reason}")
-    # (此处省略具体的 requests 发送代码，与前几版一致)
+    log("=== 流程结束 ===")
 
 if __name__ == "__main__":
     main()
