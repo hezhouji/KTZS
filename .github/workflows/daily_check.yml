@@ -30,10 +30,10 @@ jobs:
         run: python main.py
 
       - name: Commit and push changes
-        run: |
-          git config --global user.name "GitHub Action"
-          git config --global user.email "action@github.com"
-          git add -A  # 使用 -A 强制添加所有文件，包括新生成的
-          git commit -m "Update history and prediction" || exit 0
-          git push
+       run: |
+        git config --local user.name "GitHub Action"
+        git config --local user.email "action@github.com"
+        git add HISTORY_LOG.csv || true  # 即使文件不存在也不报错
+        git commit -m "Update history and prediction" || echo "No changes to commit"
+        git push || echo "No changes to push"
           fi
