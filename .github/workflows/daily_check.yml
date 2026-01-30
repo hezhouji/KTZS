@@ -1,34 +1,45 @@
-name: Daily Fear Greed Index
+name: Daily Index Predictor
 
 on:
   schedule:
-    # 这里的 cron 是 UTC 时间。
-    # 北京时间 17:30 (A股收盘后) = UTC 09:30
-    # 北京时间 08:30 (美股收盘后) = UTC 00:30
-    # 我们可以设置在 UTC 09:30 运行（此时A股已收盘，美股是前一晚的数据）
-    - cron: '30 9 * * 1-5' # 周一到周五 UTC 09:30
-  workflow_dispatch: # 允许手动点击按钮触发测试
+    - cron: '0 9 * * 1-5' # 周一至周五北京时间下午5点运行（UTC 9:00）
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # 赋予写入权限，以便写回 CSV 文件
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
+        with:
+          persist-credentials: true
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: ambassadors/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: '3.9'
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
+          pip install akshare pandas numpy scipy requests
 
-      - name: Run analysis script
+      - name: Run analysis
         env:
-          # 从 GitHub Secrets 读取飞书 Webhook
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+        run: python main.py
+
+      - name: Commit and push changes
         run: |
-          python main.py
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+          # 检查是否有文件更新（HISTORY_LOG.csv）
+          git add HISTORY_LOG.csv
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update history log [skip ci]"
+            git push
+          fi
