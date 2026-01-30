@@ -19,7 +19,7 @@ def is_workday(d):
     return d.weekday() < 5
 
 def normalize_date(d_input):
-    """强制统一日期格式"""
+    """确保日期格式统一为 YYYY-MM-DD"""
     d_str = str(d_input).replace(".txt", "").replace("年", "-").replace("月", "-").replace("日", "")
     for fmt in ("%Y-%m-%d", "%Y%m%d"):
         try: return datetime.strptime(d_str, fmt).date()
@@ -37,54 +37,51 @@ def get_actual_val(date_obj):
             except: pass
     return None
 
-# --- 因子计算（带严格时间切片） ---
+# --- 核心计算：带历史切片 ---
 def calculate_factors(target_date, df_p_all, df_val_all, df_bond_all):
     try:
-        # 【修复核心】严格过滤：只保留目标日期及之前的数据
+        # 【核心修复】只看目标日期之前的数据
         df_p = df_p_all[df_p_all['date'] <= target_date].copy()
         df_val = df_val_all[df_val_all['date_key'] <= target_date].copy()
         df_bond = df_bond_all[df_bond_all['date_key'] <= target_date].copy()
 
         if len(df_p) < 30: return [50.0]*6
 
-        def p_score(series, current, inv=False):
-            p = stats.percentileofscore(series.dropna(), current)
+        def p_score(series, cur, inv=False):
+            p = stats.percentileofscore(series.dropna(), cur)
             return float(100 - p if inv else p)
 
-        # 1. 波动 (20日)
+        # 维度计算
         v = df_p['close'].pct_change().rolling(20).std()
         f1 = p_score(v, v.iloc[-1], inv=True)
-        # 2. 成交量
         v20 = df_p['volume'].rolling(20).mean()
         f2 = p_score(df_p['volume']/v20, (df_p['volume']/v20).iloc[-1])
-        # 3. 强度
         h250 = df_p['close'].rolling(250).max()
         f3 = p_score(df_p['close']/h250, (df_p['close']/h250).iloc[-1])
-        # 4. 升贴水 (模拟)
-        f4 = 50.0
-        # 5. 避险 (ERP)
+        f4 = 50.0 # 升贴水模拟
         pe_col = '市盈率1' if '市盈率1' in df_val.columns else '市盈率TTM'
         erp = (1/df_val[pe_col].astype(float)) - (df_bond['中国国债收益率10年'].astype(float)/100)
         f5 = p_score(erp, erp.iloc[-1], inv=True)
-        # 6. 杠杆
-        f6 = 50.0
+        f6 = 50.0 # 杠杆模拟
 
         return [round(x, 2) for x in [f1, f2, f3, f4, f5, f6]]
     except: return [50.0]*6
 
 def main():
-    log("=== 启动数据对齐与动态微调系统 ===")
+    log("=== 启动具备历史切片能力的分析系统 ===")
     today = datetime.now().date()
     
-    # 1. 初始化 CSV（解决 EmptyDataError）
+    # 1. 鲁棒性初始化 CSV
     cols = ["date","f1","f2","f3","f4","f5","f6","predict","actual","bias"]
-    try:
-        df_log = pd.read_csv(LOG_FILE)
-        if df_log.empty: raise pd.errors.EmptyDataError
-    except (pd.errors.EmptyDataError, FileNotFoundError):
+    if os.path.exists(LOG_FILE):
+        try:
+            df_log = pd.read_csv(LOG_FILE)
+            if df_log.empty: df_log = pd.DataFrame(columns=cols)
+        except: df_log = pd.DataFrame(columns=cols)
+    else:
         df_log = pd.DataFrame(columns=cols)
 
-    # 2. 获取数据源
+    # 2. 获取基础数据
     df_p = ak.stock_zh_index_daily(symbol="sh000300")
     df_p['date'] = pd.to_datetime(df_p['date']).dt.date
     df_val = ak.stock_zh_index_value_csindex(symbol="000300")
@@ -92,7 +89,7 @@ def main():
     df_bond = ak.bond_zh_us_rate()
     df_bond['date_key'] = pd.to_datetime(df_bond['日期']).dt.date
 
-    # 3. 历史补全 (过去14天)
+    # 3. 历史补全 (过去10个工作日)
     for i in range(14, 0, -1):
         d = today - timedelta(days=i)
         if not is_workday(d): continue
@@ -102,10 +99,10 @@ def main():
         if act:
             fs = calculate_factors(d, df_p, df_val, df_bond)
             p_val = sum(fs)/6
-            df_log = df_log[df_log['date'] != d_str] # 覆盖旧记录
+            df_log = df_log[df_log['date'] != d_str] # 覆盖
             df_log.loc[len(df_log)] = [d_str] + fs + [round(p_val, 2), act, round(act-p_val, 2)]
 
-    # 4. 权重对齐 (基于最近7天记录)
+    # 4. 权重自动对齐 (每7天)
     weights = np.array([1/6]*6)
     df_fit = df_log.dropna(subset=['actual']).tail(7)
     if len(df_fit) >= 7:
@@ -116,22 +113,21 @@ def main():
     # 5. 今日预测
     tf = calculate_factors(today, df_p, df_val, df_bond)
     tp = sum(f*w for f, w in zip(tf, weights))
-    df_log = df_log[df_log['date'] != today.strftime("%Y-%m-%d")]
-    df_log.loc[len(df_log)] = [today.strftime("%Y-%m-%d")] + tf + [round(tp, 2), np.nan, np.nan]
+    t_str = today.strftime("%Y-%m-%d")
+    df_log = df_log[df_log['date'] != t_str]
+    df_log.loc[len(df_log)] = [t_str] + tf + [round(tp, 2), np.nan, np.nan]
     
     df_log.sort_values('date').to_csv(LOG_FILE, index=False)
-    log(f"今日预测成功: {tp:.2f}")
-
+    
     # 6. 推送
-    names = ["波动", "量能", "强度", "期货", "避险", "杠杆"]
-    w_str = " | ".join([f"{n}:{w:.0%}" for n, w in zip(names, weights)])
+    w_info = " | ".join([f"{n}:{w:.0%}" for n, w in zip(["波动","量能","强度","期货","避险","杠杆"], weights)])
     payload = {
         "msg_type": "interactive",
         "card": {
             "header": {"title": {"tag": "plain_text", "content": f"🎯 恐贪 AI 预测 ({today})"}, "template": "purple"},
             "elements": [
-                {"tag": "div", "text": {"tag": "lark_md", "content": f"**最终预测值：{tp:.2f}**\n\n📊 **最新权重对齐：**\n{w_str}"}},
-                {"tag": "note", "elements": [{"tag": "plain_text", "content": f"维度分: {' / '.join(map(str, tf))}"}]}
+                {"tag": "div", "text": {"tag": "lark_md", "content": f"**今日预测：{tp:.2f}**\n\n📊 **权重对齐状态：**\n{w_info}"}},
+                {"tag": "note", "elements": [{"tag": "plain_text", "content": f"因子原始分: {' / '.join(map(str, tf))}"}]}
             ]
         }
     }
